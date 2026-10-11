@@ -1,6 +1,6 @@
 # iconmapper configuration sample.
-# Copy this file to "iconmapper.toml" next to iconmapper.exe, then edit.
-# (iconmapper looks for iconmapper.toml next to the exe, then in the CWD.)
+# Copy this file to "iconmapper.toml" (next to iconmapper.exe, or to
+# %USERPROFILE%\.local\share\iconmapper\), then edit.
 
 # How often (ms) to poll for new windows. Default: 2000
 poll_ms = 2000

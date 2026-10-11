@@ -440,6 +440,15 @@ fn config_path() -> PathBuf {
     if let Some(d) = exe_dir() {
         candidates.push(d.join("iconmapper.toml"));
     }
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("iconmapper")
+                .join("iconmapper.toml"),
+        );
+    }
     candidates.push(PathBuf::from("iconmapper.toml"));
     for c in &candidates {
         if c.is_file() {
@@ -587,7 +596,8 @@ fn now_str() -> String {
 }
 
 fn log_path() -> PathBuf {
-    exe_dir()
+    config_path()
+        .parent()
         .map(|d| d.join("iconmapper.log"))
         .unwrap_or_else(|| PathBuf::from("iconmapper.log"))
 }

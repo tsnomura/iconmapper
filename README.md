@@ -35,8 +35,9 @@ The binary is `target/release/iconmapper.exe` (GUI subsystem — no console wind
 Run `iconmapper.exe` (double-click, or your autostart mechanism of choice).
 
 - Tray icon: right-click → **Reload config (iconmapper.toml)** / **Quit iconmapper**
-- Config: `iconmapper.toml` next to the exe (falls back to the CWD). Start from [`iconmapper.example.toml`](iconmapper.example.toml).
-- Log: `iconmapper.log` next to the exe (`set icon ...` lines show what was applied)
+- Config: `iconmapper.toml` — looked up next to the exe, then in `%USERPROFILE%\.local\share\iconmapper\`, then in the CWD. Start from [`iconmapper.example.toml`](iconmapper.example.toml).
+- Log: `iconmapper.log` in the config file's directory (`set icon ...` lines show what was applied)
+- Suggested install layout: exe in `%USERPROFILE%\.local\bin\`, config + icons in `%USERPROFILE%\.local\share\iconmapper\`
 
 ## Configuration
 
