@@ -1,0 +1,10 @@
+[package]
+name = "iconmapper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }

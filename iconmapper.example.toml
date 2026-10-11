@@ -1,0 +1,26 @@
+# iconmapper configuration sample.
+# Copy this file to "iconmapper.toml" next to iconmapper.exe, then edit.
+# (iconmapper looks for iconmapper.toml next to the exe, then in the CWD.)
+
+# How often (ms) to poll for new windows. Default: 2000
+poll_ms = 2000
+
+# Rules are evaluated top to bottom; the FIRST match wins.
+# Put specific rules before generic ones.
+#
+#   exe          process name, exact match, case-insensitive (required)
+#   title        window title substring, case-insensitive
+#   title_regex  window title regex (takes priority over `title` when both set)
+#   ico          icon file; absolute path, or relative to the config file's dir
+#
+# Windows that match no rule are left untouched.
+
+[[rules]]
+exe = "notepad.exe"
+title = "todo"
+ico = "icons\\green.ico"
+
+[[rules]]
+exe = "notepad.exe"
+title_regex = "report.*\\.md"
+ico = "icons\\blue.ico"
