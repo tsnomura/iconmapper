@@ -585,9 +585,11 @@ fn box_downscale(src: &[u8], sw: i32, sh: i32, dst_sz: i32) -> Vec<u8> {
             let a = pa / n;
             out[di + 3] = (a * 255.0).round().min(255.0) as u8;
             if a > 0.0 {
-                out[di] = (pb / n / a * 255.0).round().min(255.0) as u8;
-                out[di + 1] = (pg / n / a * 255.0).round().min(255.0) as u8;
-                out[di + 2] = (pr / n / a * 255.0).round().min(255.0) as u8;
+                // pb/n is the mean premultiplied color, already in 0..255 units;
+                // dividing by the mean alpha unpremultiplies it (stays <= 255)
+                out[di] = (pb / n / a).round().min(255.0) as u8;
+                out[di + 1] = (pg / n / a).round().min(255.0) as u8;
+                out[di + 2] = (pr / n / a).round().min(255.0) as u8;
             }
         }
     }
