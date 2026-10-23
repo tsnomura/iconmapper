@@ -11,6 +11,7 @@ poll_interval_ms = 2000
 #
 # overlay_ico = "icons\\badge.ico"  # badge icon (applies to all rules)
 # overlay_scale = 0.5               # badge size as a fraction of the icon size (0.1-1.0)
+# overlay_base_scale = 0.75         # app icon shrunk to this fraction, top-left (0.1-1.0)
 # overlay_margin = 0                # inset from the bottom-right corner, in px
 
 # Rules are evaluated top to bottom; the FIRST match wins.

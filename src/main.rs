@@ -41,6 +41,8 @@ struct Config {
     overlay_ico: Option<String>,
     #[serde(default = "default_overlay_scale")]
     overlay_scale: f32,
+    #[serde(default = "default_overlay_base_scale")]
+    overlay_base_scale: f32,
     #[serde(default)]
     overlay_margin: u32,
     #[serde(default)]
@@ -53,6 +55,10 @@ fn default_poll_ms() -> u32 {
 
 fn default_overlay_scale() -> f32 {
     0.5
+}
+
+fn default_overlay_base_scale() -> f32 {
+    1.0
 }
 
 #[derive(Deserialize)]
@@ -550,13 +556,93 @@ fn nearest_resize(src: &[u8], sw: i32, sh: i32, dst_sz: i32) -> Vec<u8> {
     out
 }
 
+/// Area-averaging (box) downscale of a top-down BGRA buffer to dst_sz x
+/// dst_sz. Averaging is done in premultiplied alpha so semi-transparent
+/// edges stay clean. Only used for shrinking (dst_sz < source size).
+fn box_downscale(src: &[u8], sw: i32, sh: i32, dst_sz: i32) -> Vec<u8> {
+    let mut out = vec![0u8; (dst_sz * dst_sz * 4) as usize];
+    let fx = sw as f64 / dst_sz as f64;
+    let fy = sh as f64 / dst_sz as f64;
+    for dy in 0..dst_sz {
+        let y0 = (dy as f64 * fy).floor() as i32;
+        let y1 = (((dy + 1) as f64) * fy).ceil().min(sh as f64).max(y0 as f64 + 1.0) as i32;
+        for dx in 0..dst_sz {
+            let x0 = (dx as f64 * fx).floor() as i32;
+            let x1 = (((dx + 1) as f64) * fx).ceil().min(sw as f64).max(x0 as f64 + 1.0) as i32;
+            let (mut pb, mut pg, mut pr, mut pa) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let si = ((sy * sw + sx) * 4) as usize;
+                    let a = src[si + 3] as f64 / 255.0;
+                    pb += src[si] as f64 * a;
+                    pg += src[si + 1] as f64 * a;
+                    pr += src[si + 2] as f64 * a;
+                    pa += a;
+                }
+            }
+            let n = (x1 - x0) as f64 * (y1 - y0) as f64;
+            let di = ((dy * dst_sz + dx) * 4) as usize;
+            let a = pa / n;
+            out[di + 3] = (a * 255.0).round().min(255.0) as u8;
+            if a > 0.0 {
+                out[di] = (pb / n / a * 255.0).round().min(255.0) as u8;
+                out[di + 1] = (pg / n / a * 255.0).round().min(255.0) as u8;
+                out[di + 2] = (pr / n / a * 255.0).round().min(255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Straight-alpha "over" composite of `src` (sw x sh, top-down BGRA) onto
+/// `dst` (dw x dh) at offset (ox, oy). Out-of-range pixels are clipped.
+fn over_blend(dst: &mut [u8], dw: i32, dh: i32, src: &[u8], sw: i32, sh: i32, ox: i32, oy: i32) {
+    for sy in 0..sh {
+        let dy = oy + sy;
+        if dy < 0 || dy >= dh {
+            continue;
+        }
+        for sx in 0..sw {
+            let dx = ox + sx;
+            if dx < 0 || dx >= dw {
+                continue;
+            }
+            let si = ((sy * sw + sx) * 4) as usize;
+            let sa = src[si + 3] as u32;
+            if sa == 0 {
+                continue;
+            }
+            let di = ((dy * dw + dx) * 4) as usize;
+            let sb = src[si] as u32;
+            let sg = src[si + 1] as u32;
+            let sr = src[si + 2] as u32;
+            let db = dst[di] as u32;
+            let dg = dst[di + 1] as u32;
+            let dr = dst[di + 2] as u32;
+            let da = dst[di + 3] as u32;
+            let out_a = sa + da * (255 - sa) / 255;
+            if out_a == 0 {
+                dst[di..di + 4].fill(0);
+                continue;
+            }
+            dst[di] = ((sb * sa + db * da * (255 - sa) / 255) / out_a) as u8;
+            dst[di + 1] = ((sg * sa + dg * da * (255 - sa) / 255) / out_a) as u8;
+            dst[di + 2] = ((sr * sa + dr * da * (255 - sa) / 255) / out_a) as u8;
+            dst[di + 3] = out_a as u8;
+        }
+    }
+}
+
 /// Compose `badge` onto the bottom-right corner of `base` and return a new
-/// HICON. Both icons are already loaded at their final sizes (base at
-/// `size`, badge at `badge_sz`); their pixels are read with GetDIBits and
-/// alpha-composited in software, because GDI icon-draw calls
+/// HICON. The base icon is placed in the top-left at `size * base_scale`
+/// (like xpra's ICON_SHRINKAGE=75) and the badge at `badge_sz` in the
+/// bottom-right on top (like xpra's ICON_OVERLAY=50). Both icons are
+/// already loaded at their final sizes (base at `size`, badge at
+/// `badge_sz`); their pixels are read with GetDIBits and alpha-composited
+/// in software, because GDI icon-draw calls
 /// (DrawIcon/DrawIconEx/CreateIconFromResourceEx) are unreliable on this
 /// machine. Returns None on failure.
-unsafe fn compose_icon(base: HICON, badge: HICON, size: i32, badge_sz: i32, margin: i32) -> Option<HICON> {
+unsafe fn compose_icon(base: HICON, badge: HICON, size: i32, base_scale: f32, badge_sz: i32, margin: i32) -> Option<HICON> {
     let mut base_px: Vec<u8> = Vec::new();
     let (bw, bh) = match read_icon_bgra(base, &mut base_px) {
         Some(d) => d,
@@ -586,36 +672,18 @@ unsafe fn compose_icon(base: HICON, badge: HICON, size: i32, badge_sz: i32, marg
         badge_px = nearest_resize(&badge_px, vw, vh, badge_sz);
     }
 
-    // alpha-composite the badge (straight-alpha "over") onto the bottom-right
-    let off = (size - badge_sz - margin).max(0);
-    for by in 0..badge_sz {
-        for bx in 0..badge_sz {
-            let dx = off + bx;
-            let dy = off + by;
-            if dx >= size || dy >= size {
-                continue;
-            }
-            let si = ((by * badge_sz + bx) * 4) as usize;
-            let di = ((dy * size + dx) * 4) as usize;
-            let sb = badge_px[si] as u32;
-            let sg = badge_px[si + 1] as u32;
-            let sr = badge_px[si + 2] as u32;
-            let sa = badge_px[si + 3] as u32;
-            let db = base_px[di] as u32;
-            let dg = base_px[di + 1] as u32;
-            let dr = base_px[di + 2] as u32;
-            let da = base_px[di + 3] as u32;
-            let out_a = sa + da * (255 - sa) / 255;
-            if out_a == 0 {
-                base_px[di..di + 4].fill(0);
-                continue;
-            }
-            base_px[di] = ((sb * sa + db * da * (255 - sa) / 255) / out_a) as u8;
-            base_px[di + 1] = ((sg * sa + dg * da * (255 - sa) / 255) / out_a) as u8;
-            base_px[di + 2] = ((sr * sa + dr * da * (255 - sa) / 255) / out_a) as u8;
-            base_px[di + 3] = out_a as u8;
-        }
+    // transparent canvas: base in the top-left at base_scale, then the
+    // badge in the bottom-right on top (mirrors xpra's window_icon_image)
+    let mut canvas = vec![0u8; (size * size * 4) as usize];
+    let base_sz = (size as f32 * base_scale).floor().max(1.0) as i32;
+    if base_sz < size {
+        let shrunk = box_downscale(&base_px, size, size, base_sz);
+        over_blend(&mut canvas, size, size, &shrunk, base_sz, base_sz, 0, 0);
+    } else {
+        over_blend(&mut canvas, size, size, &base_px, size, size, 0, 0);
     }
+    let off = (size - badge_sz - margin).max(0);
+    over_blend(&mut canvas, size, size, &badge_px, badge_sz, badge_sz, off, off);
 
     // 32bpp top-down DIB holding the composed pixels
     let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -630,7 +698,7 @@ unsafe fn compose_icon(base: HICON, badge: HICON, size: i32, badge_sz: i32, marg
                 return None;
             }
         };
-    std::ptr::copy_nonoverlapping(base_px.as_ptr(), bits as *mut u8, base_px.len());
+    std::ptr::copy_nonoverlapping(canvas.as_ptr(), bits as *mut u8, canvas.len());
 
     // 1bpp top-down AND mask, all zeros (alpha comes from the 32bpp DIB)
     let mut mbits: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -726,6 +794,7 @@ fn reload_config() {
     let small_sz = unsafe { GetSystemMetrics(SM_CXSMICON) };
     let base = path.parent().map(|d| d.to_path_buf());
     let scale = cfg.overlay_scale.clamp(0.1, 1.0);
+    let base_scale = cfg.overlay_base_scale.clamp(0.1, 1.0);
     let margin = cfg.overlay_margin as i32;
     let big_badge_sz = badge_size(big_sz, scale);
     let small_badge_sz = badge_size(small_sz, scale);
@@ -780,8 +849,8 @@ fn reload_config() {
         let (big, small) = match unsafe { load_icon_pair(&ico_path, big_sz, small_sz) } {
             Ok((b, s)) => match &badge {
                 Some((bb, bs)) => match (
-                    unsafe { compose_icon(b, *bb, big_sz, big_badge_sz, margin) },
-                    unsafe { compose_icon(s, *bs, small_sz, small_badge_sz, margin) },
+                    unsafe { compose_icon(b, *bb, big_sz, base_scale, big_badge_sz, margin) },
+                    unsafe { compose_icon(s, *bs, small_sz, base_scale, small_badge_sz, margin) },
                 ) {
                     (Some(x), Some(y)) => (x, y),
                     _ => {

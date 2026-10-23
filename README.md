@@ -47,7 +47,8 @@ poll_interval_ms = 2000   # optional, default 2000
 # Badge compositing — see "Overlay" below:
 overlay_ico = "icons\\badge.ico"   # badge drawn at the bottom-right of every rule's icon
 # overlay_scale = 0.5  # badge size as a fraction of the icon size (0.1–1.0, default 0.5)
-# overlay_margin = 0   # inset from the bottom-right corner, in px (default 0)
+# overlay_base_scale = 0.75  # app icon shrunk to this fraction, top-left (0.1–1.0, default 1.0)
+# overlay_margin = 0   # badge inset from the bottom-right corner, in px (default 0)
 
 [[rules]]
 exe = "someclient.exe"        # process name: exact match, case-insensitive (required)
@@ -72,6 +73,7 @@ ico = "icons\\blue.ico"
 
 - A global `overlay_ico` applies to all rules; a per-rule `overlay_ico` overrides it, and `overlay = false` excludes a rule
 - `overlay_scale` (default `0.5`, clamped to 0.1–1.0) sizes the badge relative to the icon; `overlay_margin` (default `0`) insets it from the corner
+- `overlay_base_scale` (default `1.0`, clamped to 0.1–1.0) shrinks the app icon and places it in the **top-left** corner, matching xpra's own compositing (`ICON_SHRINKAGE=75`, `ICON_OVERLAY=50`) — set it to `0.75` for an exact xpra look
 - Compositing happens in memory at config load — no pre-baked `.ico` files needed
 - If a badge fails to load or compose, the rule falls back to its plain icon (a line is logged)
 
