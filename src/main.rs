@@ -11,7 +11,10 @@ use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::Graphics::Gdi::{
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, GetDC,
+    GetDIBits, GetObjectW, HBRUSH, ReleaseDC,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
@@ -35,11 +38,21 @@ struct Config {
     #[serde(default = "default_poll_ms")]
     poll_interval_ms: u32,
     #[serde(default)]
+    overlay_ico: Option<String>,
+    #[serde(default = "default_overlay_scale")]
+    overlay_scale: f32,
+    #[serde(default)]
+    overlay_margin: u32,
+    #[serde(default)]
     rules: Vec<RawRule>,
 }
 
 fn default_poll_ms() -> u32 {
     2000
+}
+
+fn default_overlay_scale() -> f32 {
+    0.5
 }
 
 #[derive(Deserialize)]
@@ -50,6 +63,14 @@ struct RawRule {
     #[serde(default)]
     title_regex: Option<String>,
     ico: String,
+    #[serde(default)]
+    overlay_ico: Option<String>,
+    #[serde(default = "default_true")]
+    overlay: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 struct RtRule {
@@ -73,6 +94,8 @@ struct AppState {
     // hwnd -> (last observed small, last observed big, consecutive stable-mismatch count)
     icon_track: HashMap<usize, (usize, usize, u32)>,
     poll_ms: u32,
+    badge_big: Option<HICON>,
+    badge_small: Option<HICON>,
 }
 
 // single-threaded app; raw pointer fields (HICON/HWND) are only used on the main thread
@@ -435,6 +458,227 @@ unsafe fn load_icon_pair(ico: &str, big: i32, small: i32) -> Result<(HICON, HICO
     Ok((b, s))
 }
 
+fn resolve_ico(p: &str, base: &Option<PathBuf>) -> String {
+    let path = Path::new(p);
+    if path.is_absolute() {
+        p.to_string()
+    } else {
+        base.as_ref()
+            .map(|d| d.join(path).to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string())
+    }
+}
+
+fn badge_size(icon_size: i32, scale: f32) -> i32 {
+    (icon_size as f32 * scale).round().max(8.0) as i32
+}
+
+/// Build a top-down BITMAPINFO for a w x h bitmap with `bpp` bits per pixel.
+fn top_down_bmi(w: i32, h: i32, bpp: i32) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: bpp as u16,
+            biCompression: 0, // BI_RGB
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        ..Default::default()
+    }
+}
+
+/// Read an icon's color bitmap into `out` as top-down 32bpp BGRA pixels.
+/// Returns the bitmap's (width, height), or None if the icon has no 32bpp
+/// color bitmap. Reading the bitmap directly is pixel-exact, unlike the
+/// GDI icon-draw calls which are unreliable on this machine.
+unsafe fn read_icon_bgra(icon: HICON, out: &mut Vec<u8>) -> Option<(i32, i32)> {
+    let mut ii = ICONINFO::default();
+    let read = match GetIconInfo(icon, &mut ii) {
+        Ok(()) if !ii.hbmColor.0.is_null() => {
+            let mut bm = BITMAP::default();
+            let got = GetObjectW(
+                ii.hbmColor.into(),
+                mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut BITMAP as *mut core::ffi::c_void),
+            );
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            if got == 0 || w <= 0 || h <= 0 || bm.bmBitsPixel != 32 {
+                None
+            } else {
+                out.resize((w * h * 4) as usize, 0);
+                let mut bmi = top_down_bmi(w, h, 32);
+                let dc = GetDC(None);
+                let rows = GetDIBits(
+                    dc,
+                    ii.hbmColor,
+                    0,
+                    h as u32,
+                    Some(out.as_mut_ptr() as *mut core::ffi::c_void),
+                    &mut bmi,
+                    DIB_RGB_COLORS,
+                );
+                ReleaseDC(None, dc);
+                (rows == h).then_some((w, h))
+            }
+        }
+        _ => None,
+    };
+    // GetIconInfo returns new bitmaps the caller must delete
+    let _ = DeleteObject(ii.hbmColor.into());
+    let _ = DeleteObject(ii.hbmMask.into());
+    read
+}
+
+/// Nearest-neighbor resize of a top-down BGRA buffer to dst_sz x dst_sz.
+fn nearest_resize(src: &[u8], sw: i32, sh: i32, dst_sz: i32) -> Vec<u8> {
+    let mut out = vec![0u8; (dst_sz * dst_sz * 4) as usize];
+    for dy in 0..dst_sz {
+        for dx in 0..dst_sz {
+            let sx = (dx as u32 * sw as u32 / dst_sz as u32).min((sw - 1) as u32) as i32;
+            let sy = (dy as u32 * sh as u32 / dst_sz as u32).min((sh - 1) as u32) as i32;
+            let si = ((sy * sw + sx) * 4) as usize;
+            let di = ((dy * dst_sz + dx) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    out
+}
+
+/// Compose `badge` onto the bottom-right corner of `base` and return a new
+/// HICON. Both icons are already loaded at their final sizes (base at
+/// `size`, badge at `badge_sz`); their pixels are read with GetDIBits and
+/// alpha-composited in software, because GDI icon-draw calls
+/// (DrawIcon/DrawIconEx/CreateIconFromResourceEx) are unreliable on this
+/// machine. Returns None on failure.
+unsafe fn compose_icon(base: HICON, badge: HICON, size: i32, badge_sz: i32, margin: i32) -> Option<HICON> {
+    let mut base_px: Vec<u8> = Vec::new();
+    let (bw, bh) = match read_icon_bgra(base, &mut base_px) {
+        Some(d) => d,
+        None => {
+            log_line(&format!("compose({size}): base icon has no 32bpp color bitmap"));
+            return None;
+        }
+    };
+    if bw != size || bh != size {
+        log_line(&format!(
+            "compose({size}): base icon is {bw}x{bh}, expected {size}x{size}"
+        ));
+        return None;
+    }
+    let mut badge_px: Vec<u8> = Vec::new();
+    let (vw, vh) = match read_icon_bgra(badge, &mut badge_px) {
+        Some(d) => d,
+        None => {
+            log_line(&format!("compose({size}): badge icon has no 32bpp color bitmap"));
+            return None;
+        }
+    };
+    if vw != badge_sz || vh != badge_sz {
+        log_line(&format!(
+            "compose({size}): badge icon is {vw}x{vh}, resampling to {badge_sz}x{badge_sz}"
+        ));
+        badge_px = nearest_resize(&badge_px, vw, vh, badge_sz);
+    }
+
+    // alpha-composite the badge (straight-alpha "over") onto the bottom-right
+    let off = (size - badge_sz - margin).max(0);
+    for by in 0..badge_sz {
+        for bx in 0..badge_sz {
+            let dx = off + bx;
+            let dy = off + by;
+            if dx >= size || dy >= size {
+                continue;
+            }
+            let si = ((by * badge_sz + bx) * 4) as usize;
+            let di = ((dy * size + dx) * 4) as usize;
+            let sb = badge_px[si] as u32;
+            let sg = badge_px[si + 1] as u32;
+            let sr = badge_px[si + 2] as u32;
+            let sa = badge_px[si + 3] as u32;
+            let db = base_px[di] as u32;
+            let dg = base_px[di + 1] as u32;
+            let dr = base_px[di + 2] as u32;
+            let da = base_px[di + 3] as u32;
+            let out_a = sa + da * (255 - sa) / 255;
+            if out_a == 0 {
+                base_px[di..di + 4].fill(0);
+                continue;
+            }
+            base_px[di] = ((sb * sa + db * da * (255 - sa) / 255) / out_a) as u8;
+            base_px[di + 1] = ((sg * sa + dg * da * (255 - sa) / 255) / out_a) as u8;
+            base_px[di + 2] = ((sr * sa + dr * da * (255 - sa) / 255) / out_a) as u8;
+            base_px[di + 3] = out_a as u8;
+        }
+    }
+
+    // 32bpp top-down DIB holding the composed pixels
+    let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+    let dib =
+        match CreateDIBSection(None, &top_down_bmi(size, size, 32), DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(d) if !d.0.is_null() && !bits.is_null() => d,
+            _ => {
+                log_line(&format!(
+                    "compose({size}): CreateDIBSection failed (gle={})",
+                    GetLastError().0
+                ));
+                return None;
+            }
+        };
+    std::ptr::copy_nonoverlapping(base_px.as_ptr(), bits as *mut u8, base_px.len());
+
+    // 1bpp top-down AND mask, all zeros (alpha comes from the 32bpp DIB)
+    let mut mbits: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mask =
+        match CreateDIBSection(None, &top_down_bmi(size, size, 1), DIB_RGB_COLORS, &mut mbits, None, 0) {
+            Ok(d) if !d.0.is_null() && !mbits.is_null() => d,
+            _ => {
+                let _ = DeleteObject(dib.into());
+                log_line(&format!(
+                    "compose({size}): CreateDIBSection(mask) failed (gle={})",
+                    GetLastError().0
+                ));
+                return None;
+            }
+        };
+    // zero the whole allocation (stride is DWORD-aligned, not necessarily
+    // (size+7)/8 bytes per row)
+    let mut mbm = BITMAP::default();
+    let _ = GetObjectW(
+        mask.into(),
+        mem::size_of::<BITMAP>() as i32,
+        Some(&mut mbm as *mut BITMAP as *mut core::ffi::c_void),
+    );
+    let mask_bytes = (mbm.bmWidthBytes as usize) * (mbm.bmHeight as usize);
+    std::slice::from_raw_parts_mut(mbits as *mut u8, mask_bytes).fill(0);
+
+    let mut ii = ICONINFO::default();
+    ii.fIcon = TRUE;
+    ii.hbmMask = mask;
+    ii.hbmColor = dib;
+    let icon = match CreateIconIndirect(&ii as *const ICONINFO) {
+        Ok(i) if !i.0.is_null() => i,
+        _ => {
+            let _ = DeleteObject(mask.into());
+            let _ = DeleteObject(dib.into());
+            log_line(&format!(
+                "compose({size}): CreateIconIndirect failed (gle={})",
+                GetLastError().0
+            ));
+            return None;
+        }
+    };
+    // GDI copied the bitmaps into the new icon; release both DIBs
+    let _ = DeleteObject(mask.into());
+    let _ = DeleteObject(dib.into());
+    Some(icon)
+}
+
 fn config_path() -> PathBuf {
     let mut candidates = Vec::new();
     if let Some(d) = exe_dir() {
@@ -481,6 +725,24 @@ fn reload_config() {
     let big_sz = unsafe { GetSystemMetrics(SM_CXICON) };
     let small_sz = unsafe { GetSystemMetrics(SM_CXSMICON) };
     let base = path.parent().map(|d| d.to_path_buf());
+    let scale = cfg.overlay_scale.clamp(0.1, 1.0);
+    let margin = cfg.overlay_margin as i32;
+    let big_badge_sz = badge_size(big_sz, scale);
+    let small_badge_sz = badge_size(small_sz, scale);
+
+    // global badge: drawn at the bottom-right of every rule's icon
+    // (like xpra does for icons it receives from the remote side)
+    let global_badge = match &cfg.overlay_ico {
+        Some(p) => match unsafe { load_icon_pair(&resolve_ico(p, &base), big_badge_sz, small_badge_sz) } {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log_line(&format!("overlay_ico: {e}"));
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut rules = Vec::new();
     for (i, r) in cfg.rules.iter().enumerate() {
         if r.exe.trim().is_empty() || r.ico.trim().is_empty() {
@@ -497,27 +759,51 @@ fn reload_config() {
             },
             None => None,
         };
-        let ico_path = {
-            let p = std::path::Path::new(&r.ico);
-            if p.is_absolute() {
-                r.ico.clone()
-            } else {
-                base.as_ref()
-                    .map(|d| d.join(p).to_string_lossy().into_owned())
-                    .unwrap_or_else(|| r.ico.clone())
+        // badge for this rule: per-rule overlay_ico override > global; overlay = false disables it
+        let badge = if r.overlay {
+            match &r.overlay_ico {
+                Some(p) => match unsafe {
+                    load_icon_pair(&resolve_ico(p, &base), big_badge_sz, small_badge_sz)
+                } {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        log_line(&format!("rule[{i}]: overlay_ico: {e}"));
+                        None
+                    }
+                },
+                None => global_badge.clone(),
+            }
+        } else {
+            None
+        };
+        let ico_path = resolve_ico(&r.ico, &base);
+        let (big, small) = match unsafe { load_icon_pair(&ico_path, big_sz, small_sz) } {
+            Ok((b, s)) => match &badge {
+                Some((bb, bs)) => match (
+                    unsafe { compose_icon(b, *bb, big_sz, big_badge_sz, margin) },
+                    unsafe { compose_icon(s, *bs, small_sz, small_badge_sz, margin) },
+                ) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => {
+                        log_line(&format!("rule[{i}]: icon compose failed, using icon without badge"));
+                        (b, s)
+                    }
+                },
+                None => (b, s),
+            },
+            Err(e) => {
+                log_line(&format!("rule[{i}]: {e}"));
+                continue;
             }
         };
-        match unsafe { load_icon_pair(&ico_path, big_sz, small_sz) } {
-            Ok((big, small)) => rules.push(RtRule {
-                exe: r.exe.to_ascii_lowercase(),
-                title: r.title.clone(),
-                re,
-                big,
-                small,
-                ico: r.ico.clone(),
-            }),
-            Err(e) => log_line(&format!("rule[{i}]: {e}")),
-        }
+        rules.push(RtRule {
+            exe: r.exe.to_ascii_lowercase(),
+            title: r.title.clone(),
+            re,
+            big,
+            small,
+            ico: r.ico.clone(),
+        });
     }
     let mut s = state();
     let old: Vec<(HICON, HICON)> = s.rules.iter().map(|r| (r.big, r.small)).collect();
@@ -525,13 +811,20 @@ fn reload_config() {
         s.retired.push(b);
         s.retired.push(sm);
     }
+    if let (Some(b), Some(sm)) = (s.badge_big, s.badge_small) {
+        s.retired.push(b);
+        s.retired.push(sm);
+    }
+    s.badge_big = global_badge.as_ref().map(|(b, _)| *b);
+    s.badge_small = global_badge.as_ref().map(|(_, sm)| *sm);
     s.rules = rules;
     s.poll_ms = cfg.poll_interval_ms.max(500);
     log_line(&format!(
-        "config loaded from {}: {} rule(s), poll every {} ms",
+        "config loaded from {}: {} rule(s), poll every {} ms, overlay {}",
         path.display(),
         s.rules.len(),
-        s.poll_ms
+        s.poll_ms,
+        if s.badge_big.is_some() { "on" } else { "off" }
     ));
 }
 
